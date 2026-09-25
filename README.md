@@ -41,6 +41,8 @@
 
 成功返回 `feasible: true` 及 `selection`（四点）、`hull`、`corners`（四角及有符号距离）、`metrics`；无方案返回 `feasible: false` 与 `evidence`；输入非法返回 `422`。另有 `GET /healthz` 健康检查。
 
+`metrics.sumDistance` 普通范围内为有限数值；当真实距离和超过 double 上限（约 1.8e308，例如 1e307 量级坐标的四个支撑垫）时，改为对象 `{ overflow: true, mantissa, exponent, scale, normalizedSum }`，真实值 = `mantissa × 10^exponent`，既保留数量级也保留方案间大小关系（不会再被 JSON 序列化成 `null`）。服务端内部所有比较都按参与量数量级做相对容差折算，超大有限坐标下的主目标并列仍能由次级距离和正确裁决。
+
 ## 本地运行（无需安装依赖，Node ≥ 20）
 
 ```bash

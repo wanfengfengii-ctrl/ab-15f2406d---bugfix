@@ -11,6 +11,8 @@ import {
   pointDistance,
   distanceToSegment,
   crossSign,
+  scaledSum,
+  compareScaledSum,
 } from '../server/geometry.js';
 
 test('凸包按逆时针返回并剔除共线点', () => {
@@ -110,4 +112,49 @@ test('超大坐标：多边形有符号距离返回有限值', () => {
   const d = polygonSignedDistance(bigSquareCCW, { x: 0, y: 0 });
   assert.ok(Number.isFinite(d));
   assert.ok(d > 0);
+});
+
+// ---- scaledSum / compareScaledSum：超 double 上限的求和与大小比较 ----
+
+test('scaledSum：普通范围内 value 为有限数值且与直接求和一致', () => {
+  const s = scaledSum([3, 4]);
+  assert.ok(Number.isFinite(s.value));
+  assert.ok(Math.abs(s.value - 7) < 1e-12);
+  assert.ok(Math.abs(s.norm * s.scale - 7) < 1e-12);
+});
+
+test('scaledSum：真实总和超过 double 上限时 value=Infinity 但 norm/scale 保留数量级', () => {
+  const near = 1.7e308;
+  const s = scaledSum([near, near, near, near]);
+  assert.equal(s.value, Infinity);
+  assert.ok(Number.isFinite(s.norm) && Number.isFinite(s.scale));
+  // 对数尺度还原真实总量：4×1.7e308 = 6.8e308（字面量 6.8e308 在 JS 中即 Infinity，故对数分开算）
+  const lg = Math.log10(s.norm) + Math.log10(s.scale);
+  assert.ok(Math.abs(lg - (Math.log10(6.8) + 308)) < 1e-10, `log10(sum)=${lg}`);
+});
+
+test('scaledSum：空集/全零返回 0', () => {
+  assert.equal(scaledSum([]).value, 0);
+  assert.equal(scaledSum([0, 0]).value, 0);
+});
+
+test('compareScaledSum：两个都溢出为 Infinity 的和仍能分出大小（4.032e308 > 4e308）', () => {
+  const legFar = Math.hypot(8.1, 6) * 1e307; // ≈ 1.0080178e308
+  const legNear = 1e308;
+  const far = scaledSum([legFar, legFar, legFar, legFar]);
+  const near = scaledSum([legNear, legNear, legNear, legNear]);
+  assert.equal(far.value, Infinity);
+  assert.equal(near.value, Infinity);
+  assert.equal(compareScaledSum(far, near), 1);
+  assert.equal(compareScaledSum(near, far), -1);
+  assert.equal(compareScaledSum(far, far), 0);
+});
+
+test('compareScaledSum：相对/绝对容差内视为相等，否则更小为 -1', () => {
+  const a = scaledSum([1e308, 1e308]);
+  const b = scaledSum([1e308, 1e308 * (1 + 1e-14)]);
+  // 差异 1e-14 落在 relEps=1e-12 内，视为相等
+  assert.equal(compareScaledSum(a, b, 1e-9, 1e-12), 0);
+  // 无容差时可区分
+  assert.equal(compareScaledSum(a, b, 0, 0), -1);
 });

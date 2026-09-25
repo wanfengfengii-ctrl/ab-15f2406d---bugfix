@@ -207,3 +207,79 @@ test('超大有限坐标：内侧组合也可行但裕量更小（9e306 < 1e307�
   assert.ok(Math.abs(outer.metrics.minMargin - 1e307) / 1e307 < 1e-12);
   assert.ok(outer.metrics.minMargin > inner.metrics.minMargin);
 });
+
+// 题述场景：重心 (9e307,0)，四轨候选 y=±6e307；候选 1 横向偏移
+// ±8.1e307（更远），候选 2 偏移 ±8e307（更近）。16 个组合的最小稳定
+// 裕量均为 6e307（主目标并列），但单项距离分别约 1.008e308 与 1e308，
+// 距离和超过 double 上限（约 1.8e308）。次级目标必须仍能区分并选中
+// [2,2,2,2]，且距离指标不能序列化成 null。
+function hugeTiePayload() {
+  return {
+    rails: [
+      [{ x: 0.9e307, y: -6e307 }, { x: 1e307, y: -6e307 }],
+      [{ x: 17.1e307, y: -6e307 }, { x: 17e307, y: -6e307 }],
+      [{ x: 17.1e307, y: 6e307 }, { x: 17e307, y: 6e307 }],
+      [{ x: 0.9e307, y: 6e307 }, { x: 1e307, y: 6e307 }],
+    ],
+    boundary: [
+      { x: 8.9e306, y: -6.1e307 }, { x: 1.72e308, y: -6.1e307 },
+      { x: 1.72e308, y: 6.1e307 }, { x: 8.9e306, y: 6.1e307 },
+    ],
+    cg: { x: 9e307, y: 0 },
+    toleranceX: 0,
+    toleranceY: 0,
+    minSpacing: 1,
+  };
+}
+
+test('超大有限距离：主目标并列、次级距离和超 double 上限时唯一选中更近的 [2,2,2,2]', () => {
+  const r = solve(hugeTiePayload());
+  assert.equal(r.feasible, true);
+  assert.equal(r.evaluatedCombinations, 16);
+  assert.deepEqual(r.metrics.indices, [1, 1, 1, 1]);
+  assert.deepEqual(r.selection.map((s) => s.candidateNumber), [2, 2, 2, 2]);
+  // 主目标：16 个组合裕量均为 6e307
+  assert.ok(Math.abs(r.metrics.minMargin - 6e307) / 6e307 < 1e-12);
+  assert.ok(r.corners.every((c) => Math.abs(c.margin - 6e307) / 6e307 < 1e-12));
+});
+
+test('超大有限距离：溢出的距离和以不丢数量级与大小关系的对象表达（绝不为 null）', () => {
+  const r = solve(hugeTiePayload());
+  const sd = r.metrics.sumDistance;
+  assert.equal(typeof sd, 'object');
+  assert.equal(sd.overflow, true);
+  assert.ok(Number.isFinite(sd.mantissa) && Number.isFinite(sd.exponent));
+  // 选中方案真实距离和 = 4 × 1e308 = 4e308
+  assert.equal(sd.exponent, 308);
+  assert.ok(Math.abs(sd.mantissa - 4) < 1e-9, `mantissa=${sd.mantissa}`);
+  assert.ok(Number.isFinite(sd.scale) && sd.scale > 0);
+  assert.ok(Number.isFinite(sd.normalizedSum));
+  // JSON 序列化不得再出现 null
+  const json = JSON.stringify(r);
+  assert.ok(JSON.parse(json).metrics.sumDistance.overflow === true);
+  assert.ok(!json.includes('sumDistance":null'));
+});
+
+test('超大有限距离：溢出指标仍保留候选 1（≈4.032e308）与候选 2（4e308）的大小关系', () => {
+  // 强制每条导轨都选候选 1：直接校验指标 mantissa 更大。
+  const forced = hugeTiePayload();
+  forced.rails = forced.rails.map((rail) => [rail[0]]);
+  const r1 = solve(forced);
+  const r2 = solve(hugeTiePayload());
+  assert.equal(r1.metrics.sumDistance.overflow, true);
+  assert.equal(r2.metrics.sumDistance.overflow, true);
+  const v1 = r1.metrics.sumDistance.mantissa * 10 ** (r1.metrics.sumDistance.exponent - 308);
+  const v2 = r2.metrics.sumDistance.mantissa;
+  // 候选 1 单项 ≈ sqrt(8.1²+6²)e307 ≈ 1.0080e308，四项 ≈ 4.0321e308
+  assert.ok(v1 > 4.03 && v1 < 4.04, `候选1 距离和系数=${v1}`);
+  assert.ok(Math.abs(v2 - 4) < 1e-9);
+  assert.ok(v1 > v2);
+});
+
+test('普通数值范围内距离指标语义保持不变：sumDistance 仍是普通有限数值', () => {
+  const r = solve(crossPayload());
+  assert.equal(typeof r.metrics.sumDistance, 'number');
+  assert.ok(Number.isFinite(r.metrics.sumDistance));
+  // 外档四点 (±8,0)/(0,±8) 到原点距离和 = 4×8 = 32
+  assert.ok(Math.abs(r.metrics.sumDistance - 32) < 1e-9, `sumDistance=${r.metrics.sumDistance}`);
+});

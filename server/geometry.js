@@ -191,7 +191,43 @@ export function convexHull(points) {
 }
 
 /**
- * 点到逆时针凸包边界的最小有符号距离（各边有符号距离的最小值）。
+ * 缩放归一化求和。
+ * 返回 { scale, norm, value }，数学上满足 norm * scale === Σ values：
+ * 先按最大分量归一化再累加，真实总和即使超过 double 上限（约 1.8e308）
+ * 也不会在累加阶段溢出为 Infinity；value 在能容纳时为普通有限数值，
+ * 容纳不下时为 Infinity（但 {scale, norm} 仍保留数量级与相互间大小关系）。
+ */
+export function scaledSum(values) {
+  let scale = 0;
+  for (const v of values) {
+    if (Number.isFinite(v) && Math.abs(v) > scale) scale = Math.abs(v);
+  }
+  if (scale === 0) return { scale: 0, norm: 0, value: 0 };
+  let norm = 0;
+  for (const v of values) norm += v / scale;
+  const product = norm * scale;
+  return { scale, norm, value: Number.isFinite(product) ? product : Infinity };
+}
+
+/**
+ * 比较两个 scaledSum 的真实大小，返回 -1/0/1。
+ * 先归一化到二者共同尺度再比较，避免各自还原成 Infinity 后丢失大小关系
+ * （例如 4.032e308 与 4.000e308 都溢出为 Infinity，但前者确实更大）。
+ * absEps/relEps 为“视为相等”的绝对/相对容差，绝对容差按共同尺度折算。
+ */
+export function compareScaledSum(a, b, absEps = 0, relEps = 0) {
+  if (a.scale === 0 && b.scale === 0) return 0;
+  const M = Math.max(a.scale, b.scale);
+  const za = a.scale === 0 ? 0 : a.norm * (a.scale / M);
+  const zb = b.scale === 0 ? 0 : b.norm * (b.scale / M);
+  const t = (M > 0 ? absEps / M : 0) + relEps * Math.max(Math.abs(za), Math.abs(zb));
+  if (za < zb - t) return -1;
+  if (za > zb + t) return 1;
+  return 0;
+}
+
+/**
+ * 点到（逆时针）凸包边界的最小有符号距离（各边有符号距离的最小值）。
  * 凸包退化（不足 3 个顶点）时返回 -Infinity。
  */
 export function convexMargin(hullCCW, p) {

@@ -1,4 +1,6 @@
 // 前端逻辑：录入 -> POST /api/fixture-plans -> 渲染选点/凸包/偏差矩形四角裕量。
+import { fmt, formatDistance } from './format.js';
+
 const RAIL_COLORS = ['#38bdf8', '#22d3ee', '#a78bfa', '#34d399'];
 const RAIL_NAMES = ['导轨 1', '导轨 2', '导轨 3', '导轨 4'];
 
@@ -79,10 +81,6 @@ function buildPayload() {
   };
 }
 
-function fmt(v, d = 4) {
-  return Number(v).toFixed(d).replace(/\.?0+$/, '');
-}
-
 function clearResults() {
   $('resultBody').hidden = true;
   $('resultEmpty').hidden = false;
@@ -109,19 +107,28 @@ function makeTransform(payload, result) {
     payload.cg,
     ...(result.evidence?.corners ?? result.corners ?? []),
   ];
-  const minX = Math.min(...all.map((p) => p.x));
-  const maxX = Math.max(...all.map((p) => p.x));
-  const minY = Math.min(...all.map((p) => p.y));
-  const maxY = Math.max(...all.map((p) => p.y));
-  const span = Math.max(maxX - minX, maxY - minY, 1) * 1.15;
-  const cx = (minX + maxX) / 2;
-  const cy = (minY + maxY) / 2;
-  const size = 560;
-  const scale = size / span;
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (const p of all) {
+    if (p.x < minX) minX = p.x;
+    if (p.x > maxX) maxX = p.x;
+    if (p.y < minY) minY = p.y;
+    if (p.y > maxY) maxY = p.y;
+  }
+  // 全程基于 (x-min)/span 的归一化映射：(min+max)/2 在两端接近 double
+  // 上界时会溢出为 Infinity，span*1.15 同理；留白改由固定 pad 承担。
+  const spanX = Number.isFinite(maxX - minX) ? maxX - minX : 0;
+  const spanY = Number.isFinite(maxY - minY) ? maxY - minY : 0;
+  const span = Math.max(spanX, spanY, 1);
+  const size = 600;
+  const pad = 24;
+  const inner = size - pad * 2;
+  const scale = inner / span;
+  const offX = pad + (inner - spanX * scale) / 2;
+  const offY = pad + (inner - spanY * scale) / 2;
   return {
-    toX: (x) => 20 + (x - (cx - span / 2)) * scale,
-    toY: (y) => 20 + ((cy + span / 2) - y) * scale,
-    r: 4 + scale * 0.2,
+    toX: (x) => offX + (x - minX) * scale,
+    toY: (y) => offY + (maxY - y) * scale,
+    r: 4 + Math.min(scale * 0.2, 3),
   };
 }
 
@@ -250,7 +257,7 @@ function renderSuccess(payload, result) {
 
   $('metricsBox').innerHTML = `
     <span class="metric">四角最小有符号距离 <b>${fmt(result.metrics.minMargin)}</b></span>
-    <span class="metric">四垫到重心距离和 <b>${fmt(result.metrics.sumDistance)}</b></span>
+    <span class="metric">四垫到重心距离和 <b>${formatDistance(result.metrics.sumDistance)}</b></span>
     <span class="metric">垫间最小间距 <b>${fmt(result.metrics.minGap)}</b></span>
     <span class="metric">枚举组合数 <b>${result.evaluatedCombinations}</b></span>`;
 

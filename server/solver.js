@@ -17,10 +17,33 @@ import {
   polygonSignedDistance,
   distanceToSegment,
   polygonSignedArea,
+  scaledSum,
+  compareScaledSum,
 } from './geometry.js';
 
+// 绝对容差仅在“零”附近生效；主比较一律叠加按数量级折算的相对容差，
+// 否则固定的 1e-9 在 1e307 量级（一个 ULP 就近 1e291）会把
+// 本应相等的指标判成有差异，或把严格在内的角点误判在边上。
 const EPS = 1e-9;
+const REL_EPS = 1e-12;
 const RAIL_COUNT = 4;
+
+/**
+ * 按 a、b 自身数量级折算的比较容差。
+ */
+function cmpTol(a, b) {
+  return EPS + REL_EPS * Math.max(Math.abs(a), Math.abs(b));
+}
+
+/**
+ * 尺度自适应的数值比较：a 明显大于/小于/约等于 b，返回 1/-1/0。
+ */
+function cmpNum(a, b) {
+  const t = cmpTol(a, b);
+  if (a > b + t) return 1;
+  if (a < b - t) return -1;
+  return 0;
+}
 
 function isFiniteNumber(v) {
   return typeof v === 'number' && Number.isFinite(v);
@@ -109,7 +132,7 @@ function pairGap(points) {
  * stage:
  *   boundary_failed -> spacing_failed -> hull_degenerate -> corners_failed -> feasible
  */
-function evaluate(indices, input, corners) {
+function evaluate(indices, input, corners, coordScale) {
   const points = indices.map((idx, r) => input.rails[r][idx]);
 
   const outside = [];
@@ -133,7 +156,7 @@ function evaluate(indices, input, corners) {
   }
 
   const { minGap, pair } = pairGap(points);
-  if (minGap + EPS < input.minSpacing) {
+  if (cmpNum(minGap, input.minSpacing) < 0) {
     return {
       status: 'spacing_failed',
       stage: 1,
@@ -147,7 +170,12 @@ function evaluate(indices, input, corners) {
 
   const hull = ensureCCW(convexHull(points));
   const area = polygonSignedArea(hull);
-  if (hull.length < 3 || area <= EPS) {
+  // 归一化面积在整个有限 double 范围内都可靠：真实面积超过 double 上限时
+  // polygonSignedArea 返回 +Infinity（符号仍正确），视为非退化；
+  // 无量纲面积恰为 0 才是机器精度下的共线/重合退化。
+  const areaScale = coordScale * coordScale;
+  const areaTol = Number.isFinite(areaScale) ? EPS + REL_EPS * areaScale : EPS;
+  if (hull.length < 3 || !(area > areaTol)) {
     // 退化凸包：用角点到凸包点集/线段的最近距离量化“差多少”
     let worst = 0;
     for (const c of corners) {
@@ -176,7 +204,9 @@ function evaluate(indices, input, corners) {
   }));
   const minCornerMargin = Math.min(...cornerResults.map((c) => c.margin));
 
-  if (minCornerMargin <= EPS) {
+  // 角点必须严格在内：在 1e307 量级下一个 ULP 就近 1e291，绝对 EPS 无意义，
+  // 故按角点裕量自身尺度折算“在边上”的容差。
+  if (!(minCornerMargin > EPS + REL_EPS * Math.abs(minCornerMargin))) {
     return {
       status: 'corners_failed',
       stage: 3,
@@ -190,7 +220,10 @@ function evaluate(indices, input, corners) {
     };
   }
 
-  const sumDistance = points.reduce((s, p) => s + pointDistance(p, input.cg), 0);
+  // 距离和按最大单项归一化累加：真实总和超过 double 上限时不会丢失为
+  // Infinity，从而保留各组合次级目标的真实大小关系与数量级。
+  const legDistances = points.map((p) => pointDistance(p, input.cg));
+  const distanceSum = scaledSum(legDistances);
   return {
     status: 'feasible',
     stage: 4,
@@ -200,7 +233,7 @@ function evaluate(indices, input, corners) {
     cornerResults,
     minGap,
     minCornerMargin,
-    sumDistance,
+    distanceSum,
   };
 }
 
@@ -220,11 +253,49 @@ function describeFailure(r) {
 }
 
 /**
+ * 输入坐标的整体数量级（候选点、边界、重心的最大绝对值）。
+ */
+function coordinateScale(input) {
+  let m = 0;
+  const consider = (p) => {
+    if (Number.isFinite(p.x) && Math.abs(p.x) > m) m = Math.abs(p.x);
+    if (Number.isFinite(p.y) && Math.abs(p.y) > m) m = Math.abs(p.y);
+  };
+  input.rails.forEach((rail) => rail.forEach(consider));
+  input.boundary.forEach(consider);
+  consider(input.cg);
+  return m;
+}
+
+/**
+ * 距离和指标：普通范围内保持为原有数值（距离和的有限 double）；
+ * 真实总量超过 double 上限时改以 {mantissa, exponent, ...} 表达，
+ * 不丢失数量级与方案之间的大小关系（绝不让 JSON 把 Infinity 序列化成 null）。
+ */
+function distanceMetric(sum) {
+  if (Number.isFinite(sum.value)) return sum.value;
+  // sum.norm 与 sum.scale 均为有限值：用十进制科学记数法还原真实总量。
+  // mantissa 只从对数尾数 10^frac（frac∈[0,1)）还原，避免 10^exponent
+  // 在 exponent≥309 时溢出成 Infinity。
+  const log10 = Math.log10(sum.norm) + Math.log10(sum.scale);
+  const exponent = Math.floor(log10);
+  const mantissa = 10 ** (log10 - exponent);
+  return {
+    overflow: true,
+    mantissa,
+    exponent,
+    scale: sum.scale,
+    normalizedSum: sum.norm,
+  };
+}
+
+/**
  * 主求解入口。输入为已解析的请求体，返回响应对象。
  */
 export function solve(raw) {
   const input = normalizeInput(raw);
   const corners = deviationCorners(input.cg, input.toleranceX, input.toleranceY);
+  const coordScale = coordinateScale(input);
 
   const [r0, r1, r2, r3] = input.rails.map((c) => c.length);
   let evaluated = 0;
@@ -237,29 +308,36 @@ export function solve(raw) {
       for (let i2 = 0; i2 < r2; i2++) {
         for (let i3 = 0; i3 < r3; i3++) {
           const indices = [i0, i1, i2, i3];
-          const result = evaluate(indices, input, corners);
+          const result = evaluate(indices, input, corners, coordScale);
           evaluated++;
 
           if (result.status !== 'feasible') {
             if (
               closestFailure === null ||
               result.stage > closestFailure.stage ||
-              (result.stage === closestFailure.stage && result.deficit < closestFailure.deficit - EPS)
+              (result.stage === closestFailure.stage &&
+                cmpNum(result.deficit, closestFailure.deficit) < 0)
             ) {
               closestFailure = result;
             }
             continue;
           }
 
-          if (
-            best === null ||
-            result.minCornerMargin > best.minCornerMargin + EPS ||
-            (Math.abs(result.minCornerMargin - best.minCornerMargin) <= EPS &&
-              result.sumDistance < best.sumDistance - EPS)
-            // minCornerMargin 与距离和均持平时保留先枚举到的（字典序最小）组合
-          ) {
-            best = result;
+          let replace = best === null;
+          if (best !== null) {
+            // 第一目标：最大化四角最小裕量（按数量级折算容差判定并列）
+            const byMargin = cmpNum(result.minCornerMargin, best.minCornerMargin);
+            if (byMargin > 0) {
+              replace = true;
+            } else if (byMargin === 0) {
+              // 第二目标：最小化距离和；总和即使溢出 double 也要保留真实大小关系
+              if (compareScaledSum(result.distanceSum, best.distanceSum, EPS, REL_EPS) < 0) {
+                replace = true;
+              }
+              // 第三目标：两者持平时保留先枚举到的（候选编号字典序最小）组合
+            }
           }
+          if (replace) best = result;
         }
       }
     }
@@ -280,7 +358,7 @@ export function solve(raw) {
       corners: best.cornerResults,
       metrics: {
         minMargin: best.minCornerMargin,
-        sumDistance: best.sumDistance,
+        sumDistance: distanceMetric(best.distanceSum),
         minGap: best.minGap,
         indices: best.indices,
       },

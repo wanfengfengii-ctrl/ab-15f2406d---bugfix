@@ -61,6 +61,27 @@ const hugePayload = {
   minSpacing: 1,
 };
 
+// 主目标并列、次级距离和超 double 上限的场景：
+// 重心 (9e307,0)；候选 1 横向偏移 ±8.1e307（单项≈1.008e308，更远），
+// 候选 2 偏移 ±8e307（单项 1e308，更近）；16 组四角裕量均为 6e307。
+// 必须唯一选中候选 2 [2,2,2,2]，且距离指标保留数量级（≈4e308）而非 null。
+const hugeTiePayload = {
+  rails: [
+    [{ x: 0.9e307, y: -6e307 }, { x: 1e307, y: -6e307 }],
+    [{ x: 17.1e307, y: -6e307 }, { x: 17e307, y: -6e307 }],
+    [{ x: 17.1e307, y: 6e307 }, { x: 17e307, y: 6e307 }],
+    [{ x: 0.9e307, y: 6e307 }, { x: 1e307, y: 6e307 }],
+  ],
+  boundary: [
+    { x: 8.9e306, y: -6.1e307 }, { x: 1.72e308, y: -6.1e307 },
+    { x: 1.72e308, y: 6.1e307 }, { x: 8.9e306, y: 6.1e307 },
+  ],
+  cg: { x: 9e307, y: 0 },
+  toleranceX: 0,
+  toleranceY: 0,
+  minSpacing: 1,
+};
+
 async function waitReady(proc, deadlineMs = 10000) {
   const start = Date.now();
   while (Date.now() - start < deadlineMs) {
@@ -98,6 +119,12 @@ async function main() {
     check('首页 200', home.status === 200, `status=${home.status}`);
     check('首页包含标题', html.includes('支撑垫选点裁决'));
     check('首页引用 app.js', html.includes('/app.js'));
+
+    // app.js 通过 ES module 引入 format.js，静态托管必须能取到
+    const fmtResp = await fetch(`${BASE}/format.js`);
+    const fmtJs = await fmtResp.text();
+    check('/format.js 200 且为 JS', fmtResp.status === 200 && fmtJs.includes('formatDistance'),
+      `status=${fmtResp.status}`);
 
     console.log('4) POST /api/fixture-plans 可行场景');
     const okResp = await fetch(`${BASE}/api/fixture-plans`, {
@@ -151,7 +178,32 @@ async function main() {
     check('其他指标（距离和/间距）保持有限',
       Number.isFinite(huge.metrics?.sumDistance) && Number.isFinite(huge.metrics?.minGap));
 
-    console.log('7) POST 非法输入返回 422');    const invResp = await fetch(`${BASE}/api/fixture-plans`, {
+    console.log('7) POST /api/fixture-plans 主目标并列、距离和超 double 上限');
+    const tieResp = await fetch(`${BASE}/api/fixture-plans`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(hugeTiePayload),
+    });
+    check('返回 200', tieResp.status === 200, `status=${tieResp.status}`);
+    const tie = await tieResp.json();
+    check('feasible=true', tie.feasible === true);
+    check('唯一选中更近的候选 2 序列 [2,2,2,2]',
+      JSON.stringify(tie.metrics?.indices) === '[1,1,1,1]',
+      `got=${JSON.stringify(tie.metrics?.indices)}`);
+    check('四角最小裕量约 6e307（主目标 16 组并列）',
+      Number.isFinite(tie.metrics?.minMargin) &&
+        Math.abs(tie.metrics.minMargin - 6e307) / 6e307 < 1e-9,
+      `got=${tie.metrics?.minMargin}`);
+    const sd = tie.metrics?.sumDistance;
+    check('溢出距离和为对象指标而非 null',
+      sd && typeof sd === 'object' && sd.overflow === true, `got=${JSON.stringify(sd)}`);
+    check('距离指标保留数量级 ≈4e308（mantissa≈4, exponent=308）',
+      sd?.exponent === 308 && Math.abs(sd.mantissa - 4) < 1e-6,
+      `got mantissa=${sd?.mantissa}, exponent=${sd?.exponent}`);
+    check('响应 JSON 可往返且不含 sumDistance:null',
+      (() => { JSON.parse(JSON.stringify(tie)); return sd !== null; })());
+
+    console.log('8) POST 非法输入返回 422');    const invResp = await fetch(`${BASE}/api/fixture-plans`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ rails: [], boundary: [], cg: { x: 0, y: 0 } }),
@@ -160,7 +212,7 @@ async function main() {
     const inv = await invResp.json();
     check('422 含错误说明', typeof inv.detail === 'string' && inv.detail.length > 0);
 
-    console.log('8) POST 非法 JSON 返回 400');
+    console.log('9) POST 非法 JSON 返回 400');
     const junkResp = await fetch(`${BASE}/api/fixture-plans`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
