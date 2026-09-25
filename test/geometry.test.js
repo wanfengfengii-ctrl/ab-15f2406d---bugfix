@@ -111,3 +111,52 @@ test('超大坐标：多边形有符号距离返回有限值', () => {
   assert.ok(Number.isFinite(d));
   assert.ok(d > 0);
 });
+
+// ---- 边两端坐标差本身超出 double（边界横跨 ±double 上界附近）----
+const B = 1.75e308;
+const spanBoundary = [
+  { x: -B, y: -B }, { x: B, y: -B }, { x: B, y: B }, { x: -B, y: B },
+];
+const spanCCW = ensureCCW(spanBoundary);
+
+test('跨度超 double：内部点仍判定在界内、越界点判定在外', () => {
+  assert.equal(pointInPolygon(spanCCW, { x: 1.71e308, y: 6e307 }), true);
+  assert.equal(pointInPolygon(spanCCW, { x: 0, y: 0 }), true);
+  assert.equal(pointInPolygon(spanCCW, { x: 0, y: 1.78e308 }), false);
+});
+
+test('跨度超 double：边界有符号距离不返回 NaN，内部为正且量级正确', () => {
+  // 候选点 y=6e307，距下边 y=-B 的距离已超 double；最近边是左右竖边，约 4e306
+  const d = polygonSignedDistance(spanCCW, { x: 1.71e308, y: 6e307 });
+  assert.ok(!Number.isNaN(d), '不得为 NaN');
+  assert.ok(d > 0, `内部点距离应为正，实际 ${d}`);
+  assert.ok(Math.abs(d - 4e306) / 4e306 < 1e-9, `实际 ${d}`);
+});
+
+test('跨度超 double：lineSide 不返回 NaN 且符号正确', () => {
+  // 下边 (-B,-B)->(B,-B)：内部点在其上方（左侧）
+  const inside = lineSide({ x: 0, y: 0 }, spanCCW[0], spanCCW[1]);
+  assert.ok(!Number.isNaN(inside) && inside > 0, `实际 ${inside}`);
+  // 外部点在下边下方（取明显超出边界的有限值；B±ulp 会被舍入回 B）
+  const outside = lineSide({ x: 0, y: -1.78e308 }, spanCCW[0], spanCCW[1]);
+  assert.ok(!Number.isNaN(outside) && outside < 0, `实际 ${outside}`);
+});
+
+test('跨度超 double：pointDistance 不产生 NaN，scaled 分量有限且可比较大小',
+  async () => {
+    const { pointDistanceScaled } = await import('../server/geometry.js');
+    const d = pointDistance({ x: -B, y: 0 }, { x: B, y: 0 });
+    assert.equal(Number.isNaN(d), false);
+    assert.ok(d > 1.7e308);
+    const s1 = pointDistanceScaled({ x: -B, y: 0 }, { x: B, y: 0 });
+    const s2 = pointDistanceScaled({ x: -B, y: 0 }, { x: B * 0.9, y: 0 });
+    assert.ok(Number.isFinite(s1.scale) && Number.isFinite(s1.t));
+    assert.ok(Number.isFinite(s2.scale) && Number.isFinite(s2.t));
+    assert.ok((s1.scale / s2.scale) * (s1.t / s2.t) > 1,
+      `跨距 2B 应大于跨距 1.9B：${JSON.stringify(s1)} vs ${JSON.stringify(s2)}`);
+  });
+
+test('跨度超 double：crossSign 对超大边给出正确共线/左右符号', () => {
+  assert.equal(crossSign(spanCCW[0], spanCCW[1], { x: 0, y: 0 }), 1);
+  assert.equal(crossSign(spanCCW[0], spanCCW[1], { x: 0, y: -1.78e308 }), -1);
+});

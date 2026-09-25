@@ -26,7 +26,15 @@ const MIME = {
 };
 
 function sendJson(res, status, payload) {
-  const body = JSON.stringify(payload);
+  // 兜底：正常路径下距离类指标已表达为有限数值或科学计数文本；
+  // 若仍出现 Infinity/NaN，替换为可读文本而不是让 JSON.stringify 静默变成 null，
+  // 避免调用方拿到语义为“未知”的 null 却以为是真实指标。
+  const body = JSON.stringify(payload, (key, value) => {
+    if (typeof value === 'number' && !Number.isFinite(value)) {
+      return value > 0 ? '+Infinity' : value < 0 ? '-Infinity' : 'NaN';
+    }
+    return value;
+  });
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
     'content-length': Buffer.byteLength(body),

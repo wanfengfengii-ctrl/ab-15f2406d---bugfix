@@ -207,3 +207,88 @@ test('超大有限坐标：内侧组合也可行但裕量更小（9e306 < 1e307�
   assert.ok(Math.abs(outer.metrics.minMargin - 1e307) / 1e307 < 1e-12);
   assert.ok(outer.metrics.minMargin > inner.metrics.minMargin);
 });
+
+// 报告场景：重心 (9e307,0)，候选 1 横向偏移 ±8.1e307（单项距离 ≈1.008e308），
+// 候选 2 横向偏移 ±8e307（单项距离 1e308），四角最小裕量对全部 16 个组合恒为 6e307。
+// 距离和 4.032e308（候选1）与 4e308（候选2）都超过 double 上界，
+// 旧实现直接相加得到 Infinity：次级裁决全部并列、错误保留首个枚举 [0,0,0,0]，
+// 且 JSON 序列化把 Infinity 变成 null。
+function overflowTiePayload() {
+  const B = 1.75e308; // 覆盖全部候选点的有限矩形边界（跨度本身超出 double）
+  return {
+    rails: [
+      [{ x: 9e307 - 8.1e307, y: 6e307 }, { x: 9e307 - 8e307, y: 6e307 }],
+      [{ x: 9e307 + 8.1e307, y: 6e307 }, { x: 9e307 + 8e307, y: 6e307 }],
+      [{ x: 9e307 + 8.1e307, y: -6e307 }, { x: 9e307 + 8e307, y: -6e307 }],
+      [{ x: 9e307 - 8.1e307, y: -6e307 }, { x: 9e307 - 8e307, y: -6e307 }],
+    ],
+    boundary: [
+      { x: -B, y: -B }, { x: B, y: -B }, { x: B, y: B }, { x: -B, y: B },
+    ],
+    cg: { x: 9e307, y: 0 },
+    toleranceX: 0,
+    toleranceY: 0,
+    minSpacing: 1,
+  };
+}
+
+test('距离和超出 double：主目标并列时仍按次级距离唯一选中 [2,2,2,2]', () => {
+  const r = solve(overflowTiePayload());
+  assert.equal(r.feasible, true);
+  assert.equal(r.evaluatedCombinations, 16);
+  assert.deepEqual(r.metrics.indices, [1, 1, 1, 1]);
+  assert.deepEqual(r.selection.map((s) => s.candidateNumber), [2, 2, 2, 2]);
+  assert.equal(r.metrics.minMargin, 6e307);
+  // 每垫单项距离约 1e308，均为有限值
+  for (const s of r.selection) {
+    assert.equal(typeof s.distance, 'number');
+    assert.ok(Number.isFinite(s.distance));
+    assert.ok(Math.abs(s.distance - 1e308) / 1e308 < 1e-12, `单项距离异常：${s.distance}`);
+  }
+});
+
+test('距离和超出 double：指标不得为 null，以不丢数量级的形式表达 4e308', () => {
+  const parsed = JSON.parse(JSON.stringify(solve(overflowTiePayload())));
+  assert.notEqual(parsed.metrics.sumDistance, null, 'sumDistance 绝不能序列化为 null');
+  assert.equal(typeof parsed.metrics.sumDistance, 'string');
+  const m = parsed.metrics.sumDistance.match(/^(\d(?:\.\d+)?)e\+(\d+)$/);
+  assert.ok(m, `应为十进制科学计数文本，实际 ${parsed.metrics.sumDistance}`);
+  assert.equal(Number(m[2]), 308);
+  assert.ok(Math.abs(Number(m[1]) - 4) < 1e-9, `尾数应约为 4，实际 ${m[1]}`);
+  // 精确分解两项均为有限数值：factor × scale ≈ 4e308（scale 取单项最大分量 8e307，factor≈5）
+  assert.ok(Number.isFinite(parsed.metrics.sumDistanceScale));
+  assert.ok(Number.isFinite(parsed.metrics.sumDistanceFactor));
+  const product = parsed.metrics.sumDistanceScale * parsed.metrics.sumDistanceFactor;
+  assert.ok(!Number.isFinite(product), '4e308 超出 double，乘积本身为 Infinity 属预期');
+  assert.ok(Math.abs(parsed.metrics.sumDistanceScale - 8e307) / 8e307 < 1e-12);
+  assert.ok(Math.abs(parsed.metrics.sumDistanceFactor - 5) < 1e-9);
+  assert.notEqual(parsed.metrics.minGap, null);
+});
+
+test('距离和超出 double：候选 2（4e308）严格小于候选 1（≈4.032e308）的大小关系保留', () => {
+  const logMetric = (m) => Math.log10(m.sumDistanceFactor) + Math.log10(m.sumDistanceScale);
+  const forced = (which) => {
+    const p = overflowTiePayload();
+    p.rails = p.rails.map((cands) => [cands[which]]);
+    return solve(p).metrics;
+  };
+  const far = forced(0); // 仅候选 1
+  const near = forced(1); // 仅候选 2
+  assert.ok(logMetric(near) < logMetric(far));
+  assert.ok(Math.abs(logMetric(far) - logMetric(near) - Math.log10(1.0080178569846865)) < 1e-6);
+});
+
+test('普通数值范围内：距离和等指标保持原有 number 语义', () => {
+  const r = solve(crossPayload());
+  assert.equal(typeof r.metrics.sumDistance, 'number');
+  assert.ok(Number.isFinite(r.metrics.sumDistance));
+  assert.equal(typeof r.metrics.sumDistanceScale, 'number');
+  assert.equal(typeof r.metrics.sumDistanceFactor, 'number');
+  assert.ok(
+    Math.abs(r.metrics.sumDistance - r.metrics.sumDistanceScale * r.metrics.sumDistanceFactor)
+      / r.metrics.sumDistance < 1e-12
+  );
+  assert.equal(typeof r.metrics.minGap, 'number');
+  assert.ok(Number.isFinite(r.metrics.minGap));
+  for (const s of r.selection) assert.equal(typeof s.distance, 'number');
+});

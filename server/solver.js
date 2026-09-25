@@ -13,7 +13,7 @@ import {
   ensureCCW,
   convexMargin,
   pointInPolygon,
-  pointDistance,
+  pointDistanceScaled,
   polygonSignedDistance,
   distanceToSegment,
   polygonSignedArea,
@@ -21,6 +21,60 @@ import {
 
 const EPS = 1e-9;
 const RAIL_COUNT = 4;
+
+/**
+ * 把若干“归一化标量”{scale,t}（真实值 = t*scale）加总为一个归一化标量。
+ * 单项有限但其算术和可能超过 double（如 4 个 1e308 量级的距离），
+ * 直接相加会得到 Infinity，既无法裁决大小也无法 JSON 序列化。
+ */
+function sumMagnitudes(parts) {
+  let scale = 0;
+  for (const p of parts) if (p.scale > scale) scale = p.scale;
+  if (scale === 0) return { scale: 0, t: 0 };
+  let t = 0;
+  for (const p of parts) t += (p.scale / scale) * p.t;
+  return { scale, t };
+}
+
+/** 比较两个归一化标量的大小（-1/0/1），全程只做比值，不产生溢出。 */
+function compareMagnitude(a, b) {
+  if (a.scale === 0 && b.scale === 0) return 0;
+  if (a.scale === 0) return -1;
+  if (b.scale === 0) return 1;
+  const r = (a.t / b.t) * (a.scale / b.scale);
+  if (Number.isNaN(r)) return 0;
+  if (!Number.isFinite(r)) return r > 0 ? 1 : -1;
+  return r < 1 ? -1 : r > 1 ? 1 : 0;
+}
+
+/**
+ * 归一化标量转 JSON 可用值：有限时直接返回数值；
+ * 超出 double 时输出定点尾数宽度的十进制科学计数（如 4.0000000000e+308），
+ * 不丢失数量级，同指数下按文本排序即数值排序。
+ */
+function magnitudeToValue(mag) {
+  const v = mag.scale * mag.t;
+  if (Number.isFinite(v)) return v;
+  const log = Math.log10(mag.scale) + Math.log10(mag.t);
+  let e = Math.floor(log);
+  let mantissa = 10 ** (log - e);
+  // 处理尾数显示为 10 的边界情形
+  if (mantissa.toFixed(10).startsWith('10')) {
+    mantissa /= 10;
+    e += 1;
+  }
+  return `${mantissa.toFixed(10)}e+${e}`;
+}
+
+/**
+ * 超大坐标下浮点绝对误差本身可达 1e292，固定 1e-9 的绝对容差会把
+ * 几何上相等（仅差 ulp）的裕量误判为有优劣。按参与尺度做相对比较。
+ * 超出 double 的裕量（±Infinity）只与同号无穷大视为同尺度。
+ */
+function sameScale(a, b) {
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return a === b;
+  return Math.abs(a - b) <= EPS * Math.max(1, Math.abs(a), Math.abs(b));
+}
 
 function isFiniteNumber(v) {
   return typeof v === 'number' && Number.isFinite(v);
@@ -90,18 +144,18 @@ export function deviationCorners(cg, tx, ty) {
 }
 
 function pairGap(points) {
-  let minGap = Infinity;
-  let pair = null;
+  let minGapPart = null;
   for (let i = 0; i < points.length; i++) {
     for (let j = i + 1; j < points.length; j++) {
-      const d = pointDistance(points[i], points[j]);
-      if (d < minGap) {
-        minGap = d;
-        pair = [i, j];
+      const part = pointDistanceScaled(points[i], points[j]);
+      if (minGapPart === null || compareMagnitude(part, minGapPart) < 0) {
+        minGapPart = { ...part, pair: [i, j] };
       }
     }
   }
-  return { minGap, pair };
+  if (minGapPart === null) return { minGap: Infinity, minGapPart: null, pair: null };
+  const { pair, ...mag } = minGapPart;
+  return { minGap: mag.scale * mag.t, minGapPart: mag, pair };
 }
 
 /**
@@ -132,17 +186,22 @@ function evaluate(indices, input, corners) {
     };
   }
 
-  const { minGap, pair } = pairGap(points);
-  if (minGap + EPS < input.minSpacing) {
-    return {
-      status: 'spacing_failed',
-      stage: 1,
-      indices,
-      points,
-      minGap,
-      pair,
-      deficit: input.minSpacing - minGap,
-    };
+  const { minGap, minGapPart, pair } = pairGap(points);
+  // 间距按归一化尺度比较：minGap 即使超出 double（minGap=Infinity）
+  // 也必然满足有限的 minSpacing；只在确有不足时给出缺口。
+  if (Number.isFinite(minGap)) {
+    const gapTol = EPS * Math.max(1, Math.abs(minGap), input.minSpacing);
+    if (minGap + gapTol < input.minSpacing) {
+      return {
+        status: 'spacing_failed',
+        stage: 1,
+        indices,
+        points,
+        minGap,
+        pair,
+        deficit: input.minSpacing - minGap,
+      };
+    }
   }
 
   const hull = ensureCCW(convexHull(points));
@@ -166,6 +225,7 @@ function evaluate(indices, input, corners) {
       points,
       hull,
       minGap,
+      minGapPart,
       deficit: worst,
     };
   }
@@ -175,8 +235,13 @@ function evaluate(indices, input, corners) {
     margin: convexMargin(hull, c),
   }));
   const minCornerMargin = Math.min(...cornerResults.map((c) => c.margin));
+  // “严格在内”的零界按凸包坐标尺度取相对容差：超大坐标下边上一点的
+  // 计算裕量可能只有 ±ulp（如 1e291），固定 1e-9 会把“恰好贴边”误判为在内。
+  let coordScale = 0;
+  for (const p of hull) coordScale = Math.max(coordScale, Math.abs(p.x), Math.abs(p.y));
+  const marginTol = EPS * Math.max(1, coordScale);
 
-  if (minCornerMargin <= EPS) {
+  if (!(minCornerMargin > marginTol)) {
     return {
       status: 'corners_failed',
       stage: 3,
@@ -185,12 +250,14 @@ function evaluate(indices, input, corners) {
       hull,
       cornerResults,
       minGap,
+      minGapPart,
       minCornerMargin,
       deficit: -minCornerMargin, // 越大的裕量越接近可行
     };
   }
 
-  const sumDistance = points.reduce((s, p) => s + pointDistance(p, input.cg), 0);
+  const distanceParts = points.map((p) => pointDistanceScaled(p, input.cg));
+  const sumMagnitude = sumMagnitudes(distanceParts);
   return {
     status: 'feasible',
     stage: 4,
@@ -199,21 +266,27 @@ function evaluate(indices, input, corners) {
     hull,
     cornerResults,
     minGap,
+    minGapPart,
     minCornerMargin,
-    sumDistance,
+    distanceParts,
+    sumMagnitude,
   };
+}
+
+function fixed4(v) {
+  return typeof v === 'number' && Number.isFinite(v) ? v.toFixed(4) : String(v);
 }
 
 function describeFailure(r) {
   switch (r.status) {
     case 'boundary_failed':
-      return `选点越出翼板批准边界：导轨 ${r.outside.map((o) => o.rail + 1).join('、')} 的候选点在界外（最远越界 ${r.deficit.toFixed(4)}）`;
+      return `选点越出翼板批准边界：导轨 ${r.outside.map((o) => o.rail + 1).join('、')} 的候选点在界外（最远越界 ${fixed4(r.deficit)}）`;
     case 'spacing_failed':
-      return `支撑垫间距不足：最小间距 ${r.minGap.toFixed(4)}，最小要求未满足，缺口 ${r.deficit.toFixed(4)}（导轨 ${r.pair[0] + 1} 与 ${r.pair[1] + 1}）`;
+      return `支撑垫间距不足：最小间距 ${fixed4(r.minGap)}，最小要求未满足，缺口 ${fixed4(r.deficit)}（导轨 ${r.pair[0] + 1} 与 ${r.pair[1] + 1}）`;
     case 'hull_degenerate':
       return '四个选点共线或重合，支撑凸包退化，无法围出有效支撑区域';
     case 'corners_failed':
-      return `重心偏差矩形存在角点不在支撑凸包内部：最小有符号距离 ${r.minCornerMargin.toFixed(4)}（<=0 表示越界）`;
+      return `重心偏差矩形存在角点不在支撑凸包内部：最小有符号距离 ${fixed4(r.minCornerMargin)}（<=0 表示越界）`;
     default:
       return '无可行方案';
   }
@@ -241,24 +314,28 @@ export function solve(raw) {
           evaluated++;
 
           if (result.status !== 'feasible') {
-            if (
+            const betterFailure =
               closestFailure === null ||
               result.stage > closestFailure.stage ||
-              (result.stage === closestFailure.stage && result.deficit < closestFailure.deficit - EPS)
-            ) {
-              closestFailure = result;
-            }
+              (result.stage === closestFailure.stage &&
+                result.deficit <
+                  closestFailure.deficit -
+                    EPS * Math.max(1, Math.abs(result.deficit), Math.abs(closestFailure.deficit)));
+            if (betterFailure) closestFailure = result;
             continue;
           }
 
-          if (
-            best === null ||
-            result.minCornerMargin > best.minCornerMargin + EPS ||
-            (Math.abs(result.minCornerMargin - best.minCornerMargin) <= EPS &&
-              result.sumDistance < best.sumDistance - EPS)
-            // minCornerMargin 与距离和均持平时保留先枚举到的（字典序最小）组合
-          ) {
+          if (best === null) {
             best = result;
+          } else if (!sameScale(result.minCornerMargin, best.minCornerMargin)) {
+            if (result.minCornerMargin > best.minCornerMargin) best = result;
+          } else {
+            // 主目标并列：次级目标“距离和”按归一化尺度比较，
+            // 各单项距离有限但总和可能超出 double（直接相加得到 Infinity
+            // 会使所有组合错误并列，且 JSON 序列化为 null）。
+            const cmp = compareMagnitude(result.sumMagnitude, best.sumMagnitude);
+            if (cmp < 0) best = result;
+            // 距离和也持平时保留先枚举到的（候选编号字典序最小）组合
           }
         }
       }
@@ -275,13 +352,20 @@ export function solve(raw) {
         candidateNumber: idx + 1,
         x: best.points[rail].x,
         y: best.points[rail].y,
+        distance: magnitudeToValue(best.distanceParts[rail]),
       })),
       hull: best.hull,
       corners: best.cornerResults,
       metrics: {
         minMargin: best.minCornerMargin,
-        sumDistance: best.sumDistance,
-        minGap: best.minGap,
+        // 距离和在有限 double 内时为数值；超出 double 时为不丢数量级的
+        // 十进制科学计数文本（如 4.0000000000e+308），绝不返回 null。
+        sumDistance: magnitudeToValue(best.sumMagnitude),
+        // 距离和的精确分解：sumDistance ≈ sumDistanceFactor × sumDistanceScale，
+        // 两项均为有限数值，跨方案比较时按 factor×scale 判定大小关系。
+        sumDistanceScale: best.sumMagnitude.scale,
+        sumDistanceFactor: best.sumMagnitude.t,
+        minGap: best.minGapPart ? magnitudeToValue(best.minGapPart) : best.minGap,
         indices: best.indices,
       },
     };
@@ -299,7 +383,9 @@ export function solve(raw) {
       points: closestFailure.points,
       hull: closestFailure.hull,
       corners: closestFailure.cornerResults ?? corners,
-      minGap: closestFailure.minGap ?? null,
+      minGap: closestFailure.minGapPart
+        ? magnitudeToValue(closestFailure.minGapPart)
+        : (closestFailure.minGap ?? null),
       minCornerMargin: closestFailure.minCornerMargin ?? null,
       outside: closestFailure.outside ?? null,
       deficit: closestFailure.deficit,

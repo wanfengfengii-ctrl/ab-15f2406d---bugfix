@@ -41,6 +41,13 @@
 
 成功返回 `feasible: true` 及 `selection`（四点）、`hull`、`corners`（四角及有符号距离）、`metrics`；无方案返回 `feasible: false` 与 `evidence`；输入非法返回 `422`。另有 `GET /healthz` 健康检查。
 
+`metrics` 字段说明：
+
+- `minMargin` / `minGap`：四角最小有符号距离 / 垫间最小间距，普通范围内为 number。
+- `sumDistance`：四垫到标称重心距离和。在普通 double 范围内为 number；当距离和本身超出 double 上界（各单项距离仍有限）时，改为定点尾数宽度的十进制科学计数**文本**（如 `"4.0000000000e+308"`），绝不返回 `null`，且文本大小关系与数值一致。
+- `sumDistanceScale` / `sumDistanceFactor`：距离和的精确分解（均为有限 number），`sumDistance ≈ sumDistanceFactor × sumDistanceScale`，供调用方在超界时继续做精确比较。
+- `selection[*].distance`：各支撑垫到标称重心的单项距离（有限 number；极端跨度下同样可能为科学计数文本）。
+
 ## 本地运行（无需安装依赖，Node ≥ 20）
 
 ```bash

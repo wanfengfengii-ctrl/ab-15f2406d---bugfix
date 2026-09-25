@@ -151,6 +151,53 @@ async function main() {
     check('其他指标（距离和/间距）保持有限',
       Number.isFinite(huge.metrics?.sumDistance) && Number.isFinite(huge.metrics?.minGap));
 
+    console.log('6b) POST /api/fixture-plans 距离和超出 double（重心 9e307，次级距离不同）');
+    // 主目标（四角最小裕量 6e307）对 16 个组合完全相同；
+    // 候选 2 单项距离 1e308（距离和 4e308），候选 1 约 1.008e308（和 ≈4.032e308），
+    // 两和均超 double 上界。必须唯一选中 [2,2,2,2]，距离和不得以 null 返回。
+    const B = 1.75e308;
+    const overflowPayload = {
+      rails: [
+        [{ x: 9e307 - 8.1e307, y: 6e307 }, { x: 9e307 - 8e307, y: 6e307 }],
+        [{ x: 9e307 + 8.1e307, y: 6e307 }, { x: 9e307 + 8e307, y: 6e307 }],
+        [{ x: 9e307 + 8.1e307, y: -6e307 }, { x: 9e307 + 8e307, y: -6e307 }],
+        [{ x: 9e307 - 8.1e307, y: -6e307 }, { x: 9e307 - 8e307, y: -6e307 }],
+      ],
+      boundary: [
+        { x: -B, y: -B }, { x: B, y: -B }, { x: B, y: B }, { x: -B, y: B },
+      ],
+      cg: { x: 9e307, y: 0 },
+      toleranceX: 0,
+      toleranceY: 0,
+      minSpacing: 1,
+    };
+    const ofResp = await fetch(`${BASE}/api/fixture-plans`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(overflowPayload),
+    });
+    check('返回 200', ofResp.status === 200, `status=${ofResp.status}`);
+    const of = await ofResp.json();
+    check('feasible=true', of.feasible === true);
+    check('主目标并列时唯一选择更近候选 [2,2,2,2]',
+      JSON.stringify(of.metrics?.indices) === '[1,1,1,1]',
+      `got=${JSON.stringify(of.metrics?.indices)}`);
+    check('四角最小裕量为 6e307', of.metrics?.minMargin === 6e307,
+      `got=${of.metrics?.minMargin}`);
+    check('sumDistance 不为 null（超界时为科学计数文本）',
+      of.metrics?.sumDistance !== null && of.metrics?.sumDistance !== undefined);
+    const m = /^(\d(?:\.\d+)?)e\+(\d+)$/.exec(String(of.metrics?.sumDistance));
+    check('sumDistance 表达为约 4e308，数量级与大小关系不丢失',
+      !!m && Number(m[2]) === 308 && Math.abs(Number(m[1]) - 4) < 1e-6,
+      `got=${of.metrics?.sumDistance}`);
+    check('sumDistance 精确分解两项均有限',
+      Number.isFinite(of.metrics?.sumDistanceScale) &&
+        Number.isFinite(of.metrics?.sumDistanceFactor));
+    check('每垫单项距离有限且约为 1e308',
+      Array.isArray(of.selection) && of.selection.length === 4 &&
+        of.selection.every((s) => Number.isFinite(s.distance) && s.distance > 9.9e307),
+      `got=${JSON.stringify(of.selection?.map((s) => s.distance))}`);
+
     console.log('7) POST 非法输入返回 422');    const invResp = await fetch(`${BASE}/api/fixture-plans`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },

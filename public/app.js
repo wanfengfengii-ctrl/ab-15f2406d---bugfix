@@ -80,6 +80,9 @@ function buildPayload() {
 }
 
 function fmt(v, d = 4) {
+  // 距离和超出 double 上界时服务端返回科学计数文本（如 4.0000000000e+308），
+  // 直接展示，不能再走 Number().toFixed（会显示成 Infinity）。
+  if (typeof v === 'string') return v;
   return Number(v).toFixed(d).replace(/\.?0+$/, '');
 }
 
@@ -113,15 +116,28 @@ function makeTransform(payload, result) {
   const maxX = Math.max(...all.map((p) => p.x));
   const minY = Math.min(...all.map((p) => p.y));
   const maxY = Math.max(...all.map((p) => p.y));
-  const span = Math.max(maxX - minX, maxY - minY, 1) * 1.15;
-  const cx = (minX + maxX) / 2;
-  const cy = (minY + maxY) / 2;
   const size = 560;
-  const scale = size / span;
+  const margin = 20;
+  const usable = size - 2 * margin;
+  let span = Math.max(maxX - minX, maxY - minY, 1);
+  let cx = (minX + maxX) / 2;
+  let cy = (minY + maxY) / 2;
+  if (Number.isFinite(span) && Number.isFinite(cx) && Number.isFinite(cy)) {
+    span *= 1.15;
+    const scale = usable / span;
+    return {
+      toX: (x) => margin + (x - (cx - span / 2)) * scale,
+      toY: (y) => margin + ((cy + span / 2) - y) * scale,
+      r: 4 + scale * 0.2,
+    };
+  }
+  // 坐标跨度本身超出 double（如两端逼近 ±double 上界）：无法做保持比例的
+  // 线性映射（尺度会溢出），先除以最大坐标再映射，点至多落在画布边缘，不产生 NaN。
+  const m = Math.max(...all.map((p) => Math.max(Math.abs(p.x), Math.abs(p.y))), 1);
   return {
-    toX: (x) => 20 + (x - (cx - span / 2)) * scale,
-    toY: (y) => 20 + ((cy + span / 2) - y) * scale,
-    r: 4 + scale * 0.2,
+    toX: (x) => margin + ((x / m + 1) / 2) * usable,
+    toY: (y) => margin + (1 - (y / m + 1) / 2) * usable,
+    r: 3,
   };
 }
 
